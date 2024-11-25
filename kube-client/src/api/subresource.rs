@@ -16,8 +16,10 @@ pub use kube_core::subresource::AttachParams;
 
 pub use k8s_openapi::api::autoscaling::v1::{Scale, ScaleSpec, ScaleStatus};
 
-#[cfg(feature = "ws")] use crate::api::portforward::Portforwarder;
-#[cfg(feature = "ws")] use crate::api::remote_command::AttachedProcess;
+#[cfg(feature = "ws")]
+use crate::api::portforward::Portforwarder;
+#[cfg(feature = "ws")]
+use crate::api::remote_command::AttachedProcess;
 
 /// Methods for [scale subresource](https://kubernetes.io/docs/tasks/access-kubernetes-api/custom-resources/custom-resource-definitions/#scale-subresource).
 impl<K> Api<K>
@@ -607,6 +609,6 @@ where
             .portforward(name, ports)
             .map_err(Error::BuildRequest)?;
         let stream = self.client.connect(req).await?;
-        Ok(Portforwarder::new(stream, ports))
+        Ok(Portforwarder::new(stream.into_inner(), ports))
     }
 }

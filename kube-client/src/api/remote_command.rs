@@ -2,6 +2,8 @@ use std::future::Future;
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
 
+use super::AttachParams;
+use crate::client::WsStream;
 use futures::{
     channel::{mpsc, oneshot},
     FutureExt, SinkExt, StreamExt,
@@ -12,12 +14,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream},
     select,
 };
-use tokio_tungstenite::{
-    tungstenite::{self as ws},
-    WebSocketStream,
-};
-
-use super::AttachParams;
+use tokio_tungstenite::tungstenite::{self as ws};
 
 type StatusReceiver = oneshot::Receiver<Status>;
 type StatusSender = oneshot::Sender<Status>;
@@ -112,7 +109,7 @@ pub struct AttachedProcess {
 }
 
 impl AttachedProcess {
-    pub(crate) fn new<S>(stream: WebSocketStream<S>, ap: &AttachParams) -> Self
+    pub(crate) fn new<S>(stream: WsStream<S>, ap: &AttachParams) -> Self
     where
         S: AsyncRead + AsyncWrite + Unpin + Sized + Send + 'static,
     {
@@ -259,7 +256,7 @@ impl AttachedProcess {
     }
 }
 
-// theses values come from here: https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/cri/streaming/remotecommand/websocket.go#L34
+// theses values come from here: https://github.com/kubernetes/kubernetes/blob/9791f0d/staging/src/k8s.io/apimachinery/pkg/util/remotecommand/constants.go#L59
 const STDIN_CHANNEL: u8 = 0;
 const STDOUT_CHANNEL: u8 = 1;
 const STDERR_CHANNEL: u8 = 2;
@@ -267,9 +264,11 @@ const STDERR_CHANNEL: u8 = 2;
 const STATUS_CHANNEL: u8 = 3;
 // resize channel is use to send TerminalSize object to change the size of the terminal
 const RESIZE_CHANNEL: u8 = 4;
+// close channel added in subproto v5 is used to close the stream.
+const CLOSE_STREAM: u8 = 255;
 
 async fn start_message_loop<S>(
-    stream: WebSocketStream<S>,
+    stream: WsStream<S>,
     stdin: impl AsyncRead + Unpin,
     mut stdout: Option<impl AsyncWrite + Unpin>,
     mut stderr: Option<impl AsyncWrite + Unpin>,
@@ -280,7 +279,8 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Sized + Send + 'static,
 {
     let mut stdin_stream = tokio_util::io::ReaderStream::new(stdin);
-    let (mut server_send, raw_server_recv) = stream.split();
+    let should_send_close = stream.supports_closing();
+    let (mut server_send, raw_server_recv) = stream.into_inner().split();
     // Work with filtered messages to reduce noise.
     let mut server_recv = raw_server_recv.filter_map(filter_message).boxed();
     let mut have_terminal_size_rx = terminal_size_rx.is_some();
@@ -310,11 +310,22 @@ where
                         status_tx.send(status).map_err(|_| Error::SendStatus)?;
                         break
                     },
+                    Some(Ok(Message::Close)) => {
+                                // Stdin closed (reader half dropped).
+                                if should_send_close {
+                                      server_send.send(ws::Message::binary([CLOSE_STREAM, STDIN_CHANNEL])).await.map_err(Error::SendClose)?;
+                                }
+                                server_send.close().await.map_err(Error::SendClose)?;
+                        break
+                    },
                     Some(Err(err)) => {
                         return Err(Error::ReceiveWebSocketMessage(err));
                     },
                     None => {
-                        // Connection closed properly
+                        // Connection closed
+                        if should_send_close {
+                              server_send.send(ws::Message::binary([CLOSE_STREAM, STDIN_CHANNEL])).await.map_err(Error::SendClose)?;
+                        }
                         break
                     },
                 }
@@ -338,6 +349,9 @@ where
                     None => {
                         // Stdin closed (writer half dropped).
                         // Let the server know and disconnect.
+                        if should_send_close {
+                              server_send.send(ws::Message::binary([CLOSE_STREAM,STDOUT_CHANNEL])).await.map_err(Error::SendClose)?;
+                        }
                         server_send.close().await.map_err(Error::SendClose)?;
                         break;
                     }
@@ -371,6 +385,8 @@ enum Message {
     Stderr(Vec<u8>),
     /// To error/status channel (3)
     Status(Vec<u8>),
+    /// To close the stream (255)
+    Close,
 }
 
 // Filter to reduce all the possible WebSocket messages into a few we expect to receive.
@@ -382,6 +398,7 @@ async fn filter_message(wsm: Result<ws::Message, ws::Error>) -> Option<Result<Me
             STDOUT_CHANNEL => Some(Ok(Message::Stdout(bin))),
             STDERR_CHANNEL => Some(Ok(Message::Stderr(bin))),
             STATUS_CHANNEL => Some(Ok(Message::Status(bin))),
+            CLOSE_STREAM => Some(Ok(Message::Close)),
             // We don't receive messages to stdin and resize channels.
             _ => None,
         },

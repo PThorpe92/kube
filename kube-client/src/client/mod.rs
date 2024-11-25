@@ -11,7 +11,8 @@ use either::{Either, Left, Right};
 use futures::{future::BoxFuture, AsyncBufRead, StreamExt, TryStream, TryStreamExt};
 use http::{self, Request, Response};
 use http_body_util::BodyExt;
-#[cfg(feature = "ws")] use hyper_util::rt::TokioIo;
+#[cfg(feature = "ws")]
+use hyper_util::rt::TokioIo;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1 as k8s_meta_v1;
 pub use kube_core::response::Status;
 use serde::de::DeserializeOwned;
@@ -42,12 +43,15 @@ pub use auth::Error as AuthError;
 pub use config_ext::ConfigExt;
 pub mod middleware;
 
-#[cfg(any(feature = "rustls-tls", feature = "openssl-tls"))] mod tls;
+#[cfg(any(feature = "rustls-tls", feature = "openssl-tls"))]
+mod tls;
 
 #[cfg(feature = "openssl-tls")]
 pub use tls::openssl_tls::Error as OpensslTlsError;
-#[cfg(feature = "rustls-tls")] pub use tls::rustls_tls::Error as RustlsTlsError;
-#[cfg(feature = "ws")] mod upgrade;
+#[cfg(feature = "rustls-tls")]
+pub use tls::rustls_tls::Error as RustlsTlsError;
+#[cfg(feature = "ws")]
+mod upgrade;
 
 #[cfg(feature = "oauth")]
 #[cfg_attr(docsrs, doc(cfg(feature = "oauth")))]
@@ -57,7 +61,11 @@ pub use auth::OAuthError;
 #[cfg_attr(docsrs, doc(cfg(feature = "oidc")))]
 pub use auth::oidc_errors;
 
-#[cfg(feature = "ws")] pub use upgrade::UpgradeConnectionError;
+#[cfg(feature = "ws")]
+pub use upgrade::UpgradeConnectionError;
+
+#[cfg(feature = "ws")]
+pub use upgrade::WsStream;
 
 #[cfg(feature = "kubelet-debug")]
 #[cfg_attr(docsrs, doc(cfg(feature = "kubelet-debug")))]
@@ -193,8 +201,9 @@ impl Client {
     pub async fn connect(
         &self,
         request: Request<Vec<u8>>,
-    ) -> Result<WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>> {
+    ) -> Result<upgrade::WsStream<TokioIo<hyper::upgrade::Upgraded>>> {
         use http::header::HeaderValue;
+        use upgrade::WS_PROTOCOLS;
         let (mut parts, body) = request.into_parts();
         parts
             .headers
@@ -211,25 +220,24 @@ impl Client {
             http::header::SEC_WEBSOCKET_KEY,
             key.parse().expect("valid header value"),
         );
-        // Use the binary subprotocol v4, to get JSON `Status` object in `error` channel (3).
-        // There's no official documentation about this protocol, but it's described in
-        // [`k8s.io/apiserver/pkg/util/wsstream/conn.go`](https://git.io/JLQED).
-        // There's a comment about v4 and `Status` object in
-        // [`kublet/cri/streaming/remotecommand/httpstream.go`](https://git.io/JLQEh).
+        // Attempt to use the binary subprotocol v5, to get JSON `Status` object in `error` channel (3).
+        // introduced in v4, and to support stream close (v5). There's no official documentation
+        // about this protocol, but it's described in
+        // [kubernetes/kubernetes/blob/master/staging/src/k8s.io/apimachinery/pkg/util/remotecommand/constants.go]
         parts.headers.insert(
             http::header::SEC_WEBSOCKET_PROTOCOL,
-            HeaderValue::from_static(upgrade::WS_PROTOCOL),
+            HeaderValue::from_static(WS_PROTOCOLS),
         );
 
         let res = self.send(Request::from_parts(parts, Body::from(body))).await?;
-        upgrade::verify_response(&res, &key).map_err(Error::UpgradeConnection)?;
+        let proto = upgrade::verify_response(&res, &key).map_err(Error::UpgradeConnection)?;
+        tracing::info!("WebSocket connection established with protocol: {:?}", proto);
         match hyper::upgrade::on(res).await {
-            Ok(upgraded) => Ok(WebSocketStream::from_raw_socket(
-                TokioIo::new(upgraded),
-                ws::protocol::Role::Client,
-                None,
-            )
-            .await),
+            Ok(upgraded) => Ok(upgrade::WsStream::new(
+                WebSocketStream::from_raw_socket(TokioIo::new(upgraded), ws::protocol::Role::Client, None)
+                    .await,
+                proto,
+            )),
 
             Err(e) => Err(Error::UpgradeConnection(
                 UpgradeConnectionError::GetPendingUpgrade(e),

@@ -1,11 +1,61 @@
+use std::str::FromStr;
+
 use http::{self, Response, StatusCode};
 use thiserror::Error;
-use tokio_tungstenite::tungstenite as ws;
+use tokio_tungstenite::{tungstenite as ws, WebSocketStream};
 
 use crate::client::Body;
 
-// Binary subprotocol v4. See `Client::connect`.
-pub const WS_PROTOCOL: &str = "v4.channel.k8s.io";
+// Binary subprotocol v4. implements v3 and adds support for json exit codes.
+pub const WS_PROTOCOL_V4: &str = "v4.channel.k8s.io";
+
+// Binary subprotocol v5. implements v4 and adds CLOSE signal.
+pub const WS_PROTOCOL_V5: &str = "v5.channel.k8s.io";
+
+pub const WS_PROTOCOLS: &str = "v5.channel.k8s.io,v4.channel.k8s.io";
+
+#[cfg(feature = "ws")]
+#[derive(Debug, Clone, Copy)]
+pub enum SubProto {
+    V4,
+    V5,
+}
+
+impl FromStr for SubProto {
+    type Err = &'static str;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            WS_PROTOCOL_V4 => Ok(SubProto::V4),
+            WS_PROTOCOL_V5 => Ok(SubProto::V5),
+            _ => Err("invalid subprotocol"),
+        }
+    }
+}
+#[allow(missing_docs)]
+#[cfg(feature = "ws")]
+#[cfg_attr(docsrs, doc(cfg(feature = "ws")))]
+pub struct WsStream<S> {
+    stream: WebSocketStream<S>,
+    proto: SubProto,
+}
+
+impl<S> WsStream<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Sized + Send + 'static,
+{
+    #[allow(missing_docs)]
+    pub fn new(stream: WebSocketStream<S>, proto: SubProto) -> Self {
+        Self { stream, proto }
+    }
+    #[allow(missing_docs)]
+    pub fn into_inner(self) -> WebSocketStream<S> {
+        self.stream
+    }
+    #[allow(missing_docs)]
+    pub fn supports_closing(&self) -> bool {
+        matches!(self.proto, SubProto::V5)
+    }
+}
 
 /// Possible errors from upgrading to a WebSocket connection
 #[cfg(feature = "ws")]
@@ -42,7 +92,7 @@ pub enum UpgradeConnectionError {
 
 // Verify upgrade response according to RFC6455.
 // Based on `tungstenite` and added subprotocol verification.
-pub fn verify_response(res: &Response<Body>, key: &str) -> Result<(), UpgradeConnectionError> {
+pub fn verify_response(res: &Response<Body>, key: &str) -> Result<SubProto, UpgradeConnectionError> {
     if res.status() != StatusCode::SWITCHING_PROTOCOLS {
         return Err(UpgradeConnectionError::ProtocolSwitch(res.status()));
     }
@@ -74,17 +124,15 @@ pub fn verify_response(res: &Response<Body>, key: &str) -> Result<(), UpgradeCon
     {
         return Err(UpgradeConnectionError::SecWebSocketAcceptKeyMismatch);
     }
-
-    // Make sure that the server returned the correct subprotocol.
-    if !headers
+    // Check for supported subprotocol and return it
+    headers
         .get(http::header::SEC_WEBSOCKET_PROTOCOL)
-        .map(|h| h == WS_PROTOCOL)
-        .unwrap_or(false)
-    {
-        return Err(UpgradeConnectionError::SecWebSocketProtocolMismatch);
-    }
-
-    Ok(())
+        .map(|h| {
+            SubProto::from_str(h.to_str().unwrap_or(""))
+                .map_err(|_| UpgradeConnectionError::SecWebSocketProtocolMismatch)
+        })
+        .take()
+        .unwrap_or(Err(UpgradeConnectionError::SecWebSocketProtocolMismatch))
 }
 
 /// Generate a random key for the `Sec-WebSocket-Key` header.
